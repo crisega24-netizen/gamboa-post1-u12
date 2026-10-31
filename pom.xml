@@ -40,6 +40,13 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- ArchUnit: reglas de arquitectura (limites entre paquetes) como pruebas JUnit 5 -->
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <version>1.3.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -47,6 +54,19 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <!-- ReglasArquitectura no termina en Test/Tests: sin esta inclusion, Surefire no la
+                 ejecutaria en "mvn test" ni en "mvn verify", solo con -Dtest=ReglasArquitectura -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                        <include>**/ReglasArquitectura.java</include>
+                    </includes>
+                </configuration>
             </plugin>
         </plugins>
     </build>
