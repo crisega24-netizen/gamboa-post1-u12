@@ -1,8 +1,6 @@
 package com.empresa.reembolsos.procesamiento.validacion;
 
 import com.empresa.reembolsos.dominio.SolicitudReembolso;
-import com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.YearMonth;
@@ -17,12 +15,6 @@ import java.util.List;
  */
 @Component
 public class ValidadorDuplicados extends ValidadorSolicitud {
-
-    // VIOLACION INTENCIONAL (Paso 5 de la Parte 2): "atajo" para consultar la base de datos
-    // directamente desde el validador. Compila y no rompe ninguna prueba funcional, pero
-    // procesamiento pasa a depender de infraestructura: la Regla 1 de ArchUnit debe detectarlo.
-    @Autowired
-    private RepositorioSolicitudesJpa repositorio;
 
     @Override
     protected ResultadoValidacion validarPropio(SolicitudReembolso solicitud, List<SolicitudReembolso> pendientes) {
