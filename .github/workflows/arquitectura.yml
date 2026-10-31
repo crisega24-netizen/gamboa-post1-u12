@@ -1,0 +1,31 @@
+name: Validacion Arquitectonica
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  arquitectura:
+    name: Reglas ArchUnit y suite completa
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Obtener el codigo
+        uses: actions/checkout@v5
+
+      - name: Configurar Java 17 (Temurin) con cache de Maven
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      # Primero las reglas: si se rompe un limite entre paquetes, el job falla aqui
+      # con el mensaje de ArchUnit, antes de gastar tiempo en el resto de las pruebas.
+      - name: Ejecutar reglas de arquitectura
+        run: ./mvnw test -Dtest=ReglasArquitectura --batch-mode --no-transfer-progress
+
+      - name: Ejecutar suite completa de pruebas
+        run: ./mvnw verify --batch-mode --no-transfer-progress
