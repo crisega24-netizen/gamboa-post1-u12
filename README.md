@@ -113,6 +113,50 @@ Al implementar se encontraron siete inconsistencias en el código de ejemplo de 
 
 ---
 
+## Qué se descartó y por qué
+
+Durante el diseño y la implementación se consideraron alternativas más sofisticadas que las que se construyeron. Cada una se evaluó con la misma pregunta de la Guía (sección 4.2): **¿la variabilidad que la justificaría es real y está documentada hoy, o es especulación sobre un futuro que aún no llegó?** Ningún descarte es definitivo. Cada uno es la decisión vigente hoy, junto con la señal concreta que haría reabrirla.
+
+| # | Alternativa considerada | Origen | Principio que la descarta | Señal para reconsiderarla |
+|---|-------------------------|--------|---------------------------|---------------------------|
+| 1 | `ApplicationEventPublisher` + `@EventListener` en vez de `List<ObservadorCambioEstado>` | Ejemplo de la guía | Test de explicabilidad | Observadores asíncronos, o que deban esperar al *commit* |
+| 2 | Visitor o Abstract Factory para exportar reportes en varios formatos | Ejemplo de la guía | YAGNI y Rule of Three | Un segundo formato pedido de verdad |
+| 3 | **Patrón State** para las transiciones de `EstadoSolicitud` | Propio | Test de explicabilidad y YAGNI | Finanzas define un flujo con transiciones prohibidas o comportamiento por estado |
+| 4 | **Entidad JPA separada + mapper** (`SolicitudReembolsoEntity`) | Propio | YAGNI | El modelo de la tabla deja de coincidir con el del dominio |
+| 5 | **Topes en configuración externa** (`@ConfigurationProperties`) | Propio | Rule of Three | Finanzas pide ajustar topes sin desplegar una versión nueva |
+
+### 1. Spring `ApplicationEventPublisher` en vez de una lista de observadores inyectada *(ejemplo de referencia)*
+
+- **Qué se consideró:** publicar un evento de dominio (`SolicitudEstadoCambiadoEvent`) con `ApplicationEventPublisher` y que cada interesado lo escuchara con `@EventListener`, como muestra la Guía (sección 2.3), en lugar de inyectar `List<ObservadorCambioEstado>` en el servicio.
+- **Por qué se descartó:** con exactamente tres observadores fijos y conocidos en tiempo de compilación, el bus de eventos genérico no aporta desacoplamiento real, porque la interfaz `ObservadorCambioEstado` ya lo logra. En cambio, dificulta rastrear en el código quién reacciona a qué cambio: con la lista basta con buscar las implementaciones de la interfaz. Es el mismo costo de depuración que la Guía advierte sobre Observer con eventos. No pasa el test de explicabilidad, porque no hay una oración que justifique la indirección adicional con los requisitos actuales.
+- **Señal para reconsiderarlo:** la integración con la API de Contabilidad (ADR-001). Si esa llamada debe ejecutarse **después del *commit*** o **en segundo plano**, para que una API lenta no bloquee la respuesta HTTP, `@TransactionalEventListener` y `@Async` resuelven exactamente eso, y el bus pasaría a aportar algo que la lista no da.
+
+### 2. Visitor o Abstract Factory para exportar reportes en varios formatos *(ejemplo de referencia)*
+
+- **Qué se consideró:** anticipar que Contabilidad pediría exportar el historial de solicitudes en PDF, Excel y CSV, y construir desde ahora una jerarquía de exportadores.
+- **Por qué se descartó:** en este proyecto la variabilidad ni siquiera existe. La especificación no tiene **ningún** requisito de exportación. Lo más cercano es el reporte trimestral de auditoría, que se alimenta del registro que ya deja `NotificadorAuditoria`. Sin un primer formato, mucho menos tres, la Rule of Three de la Guía (sección 4.2) no se cumple, y construir la abstracción ahora sería resolver un problema que todavía no existe (YAGNI).
+- **Señal para reconsiderarlo:** el primer requisito real de exportación se implementa como una clase simple. Solo cuando llegue un **segundo formato pedido** y se vea qué tienen en común ambos, se extrae la abstracción, con base en dos casos reales y no imaginados.
+
+### 3. Patrón State para las transiciones de la solicitud *(propio)*
+
+- **Qué se consideró:** al implementar `cambiarEstado`, se notó que el servicio acepta **cualquier** transición. Por ejemplo, una solicitud `APROBADA` puede volver a `PENDIENTE`, y el cambio se notifica a los tres observadores. Se consideró modelar cada estado como una clase (`EstadoPendiente`, `EstadoAprobada`…) con el patrón State, para que cada estado decidiera qué transiciones admite.
+- **Por qué se descartó:** la especificación **no define reglas de transición**. Solo enumera los estados y pide notificar cada cambio. Inventarlas sería decidir reglas de negocio que Finanzas no ha pedido. Además, el único comportamiento que hoy depende del estado («Contabilidad solo reacciona a APROBADA») ya está resuelto dentro de `NotificadorContabilidad`. Moverlo a State lo dispersaría en cuatro clases sin ganar nada. No pasa el test de explicabilidad: la única justificación posible sería «por si las transiciones se vuelven complejas».
+- **Señal para reconsiderarlo:** que Finanzas defina un flujo con transiciones prohibidas (por ejemplo, «una solicitud aprobada no puede reabrirse») o **comportamiento distinto según el estado** (por ejemplo, «en `REQUIERE_CORRECCION` el empleado puede editar el monto, en los demás no»). Si solo aparecen una o dos transiciones prohibidas, bastaría una validación en el servicio. State se justificaría cuando el comportamiento por estado crezca.
+
+### 4. Entidad JPA separada del modelo de dominio, con su mapper *(propio)*
+
+- **Qué se consideró:** para cumplir el checkpoint de un dominio sin JPA (hallazgo 3), la solución habitual en Hexagonal es duplicar el modelo: una `SolicitudReembolsoEntity` anotada con `@Entity` en `infraestructura`, más un mapper que copie los datos entre la entidad y `SolicitudReembolso`.
+- **Por qué se descartó:** las dos clases tendrían **exactamente los mismos 9 campos**. El mapper sería código de copia sin ninguna transformación, que habría que mantener sincronizado cada vez que se agregue un campo, y que puede introducir errores silenciosos si se olvida uno. El mapeo en `orm.xml` da la misma independencia del dominio con un solo archivo declarativo y sin código repetido (YAGNI). Además, es coherente con ADR-001: no se construye la infraestructura de Hexagonal sin un motivo real.
+- **Señal para reconsiderarlo:** que el modelo de persistencia **deje de coincidir** con el de dominio. Por ejemplo: columnas técnicas de auditoría (`creado_por`, `version`) que el dominio no debe ver, una tabla separada para los documentos soporte, o un segundo almacenamiento con otra estructura. Ahí el mapper sí haría una transformación real.
+
+### 5. Topes de reembolso en configuración externa *(propio)*
+
+- **Qué se consideró:** al corregir el hallazgo 1 y llevar los topes a cada estrategia, se pensó en sacarlos a `application.properties` con una clase `@ConfigurationProperties` (por ejemplo, `reembolsos.topes.viaje-diario=150000`), para que Finanzas pudiera cambiarlos sin modificar código.
+- **Por qué se descartó:** los topes son parte de la fórmula de cada categoría. Cada estrategia los usa de una manera distinta (diario, mensual o anual, con o sin porcentaje), y la especificación no menciona que cambien ni que Finanzas quiera ajustarlos por su cuenta. Externalizarlos agregaría una segunda fuente de verdad para algo que hoy no varía. Además, cada categoría nueva necesitaría su propia configuración, así que agregar «bienestar» ya no sería solo crear una clase. No hay ni un caso de ajuste de topes, menos los tres de la Rule of Three.
+- **Señal para reconsiderarlo:** que Finanzas pida **ajustar un tope sin desplegar** una versión nueva, por ejemplo el reajuste anual por inflación. Como los topes ya están en un solo lugar (`topeSolicitud` de cada estrategia), moverlos a configuración tocaría solo las tres calculadoras.
+
+---
+
 ## Ejecución
 
 ```bash
