@@ -5,6 +5,18 @@ Juan Sebastián Gamboa Cristancho · Universidad de Santander (UDES) · Cúcuta,
 
 Sistema Spring Boot que reemplaza la hoja de cálculo del área de Finanzas para gestionar solicitudes de reembolso de gastos. Los empleados registran la categoría, el monto, la fecha del gasto y si adjuntaron los documentos soporte; el sistema valida la solicitud, calcula el monto aprobado y notifica a los interesados cada vez que la solicitud cambia de estado.
 
+## Contenido
+
+1. [Diseño Propuesto](#diseño-propuesto) *(escrito antes del código)*
+2. [Arquitectura resultante](#arquitectura-resultante)
+3. [Decisiones de diseño 1 a 4](#decisiones-de-diseño)
+4. [ADR-001 (resumen)](#adr-001-resumen)
+5. [Qué se descartó y por qué](#qué-se-descartó-y-por-qué)
+6. [Validación arquitectónica en GitHub Actions](#validación-arquitectónica-en-github-actions)
+7. [Hallazgos sobre el código de referencia de la guía](#hallazgos-sobre-el-código-de-referencia-de-la-guía)
+8. [Pruebas](#pruebas)
+9. [Ejecución](#ejecución)
+
 ---
 
 ## Diseño Propuesto
@@ -35,7 +47,7 @@ Los tres patrones conviven en el mismo flujo y cada uno pasa los criterios de la
 - **Interfaz natural:** la cadena de validación entrega una solicitud válida que la estrategia de cálculo consume, y el resultado persistido es lo que los observadores reciben. No hace falta ningún adaptador entre ellos.
 - **Saturación:** son tres patrones, uno por requisito, coordinados en un único servicio de aplicación. Cualquier patrón adicional deberá pasar el mismo análisis antes de entrar al diseño.
 
-## Estructura de paquetes prevista
+### Estructura de paquetes prevista
 
 ```
 src/main/java/com/empresa/reembolsos/
@@ -49,6 +61,39 @@ src/main/java/com/empresa/reembolsos/
 ├── infraestructura/    ← RepositorioSolicitudesJpa
 └── adaptadores/rest/   ← SolicitudReembolsoController
 ```
+
+---
+
+## Arquitectura resultante
+
+El sistema quedó en **capas simples** (ver [ADR-001](docs/adr/ADR-001.md)), con los tres patrones aislados en `procesamiento` y coordinados por un único servicio de aplicación:
+
+```mermaid
+flowchart LR
+    REST["adaptadores.rest<br/>SolicitudReembolsoController<br/>ManejadorErroresRest"] --> APP["aplicacion<br/>SolicitudReembolsoService"]
+    APP -->|"RF1 validar"| VAL["procesamiento.validacion<br/>CadenaValidadores"]
+    APP -->|"RF2 calcular"| CAL["procesamiento.calculo<br/>SelectorCalculadora"]
+    APP -->|"RF3 notificar"| NOT["procesamiento.notificacion<br/>List&lt;ObservadorCambioEstado&gt;"]
+    APP --> INF["infraestructura<br/>RepositorioSolicitudesJpa"]
+    VAL -->|"topeSolicitud()"| CAL
+    INF -.->|"META-INF/orm.xml"| DOM["dominio<br/>SolicitudReembolso"]
+```
+
+| Paquete | Contenido | Límite verificado por ArchUnit |
+|---------|-----------|--------------------------------|
+| `dominio` | `SolicitudReembolso`, `CategoriaGasto`, `EstadoSolicitud`: objetos Java planos, sin Spring ni JPA | El mapeo JPA vive en `META-INF/orm.xml` |
+| `procesamiento.validacion` | **Chain of Responsibility:** `ValidadorSolicitud` (abstracto) → `ValidadorDocumentosSoporte` → `ValidadorMontoMaximo` → `ValidadorDuplicados`, ensamblados en `CadenaValidadores` | Regla 1: sin infraestructura, adaptadores, JPA ni web |
+| `procesamiento.calculo` | **Strategy:** `CalculadoraReembolso` y sus 3 estrategias, más `SelectorCalculadora` | Reglas 1 y 3 |
+| `procesamiento.notificacion` | **Observer:** `ObservadorCambioEstado` y los notificadores de Empleado, Contabilidad y Auditoría | Reglas 1 y 4 |
+| `aplicacion` | `SolicitudReembolsoService` (coordina los tres patrones), `SolicitudInvalidaException`, `SolicitudNoEncontradaException` | — |
+| `infraestructura` | `RepositorioSolicitudesJpa` (Spring Data JPA, sin puerto intermedio) | — |
+| `adaptadores.rest` | `POST /api/solicitudes`, `PUT /api/solicitudes/{id}/estado`, y errores 400/404 en formato Problem Details | Regla 2: solo servicio y dominio |
+
+**Flujo de una solicitud:**
+
+1. `POST /api/solicitudes` → el servicio carga las solicitudes **pendientes** del empleado y las pasa con la nueva por la **cadena de validación** (RF1). El primer eslabón que la rechaza corta la cadena, y la API responde **400** con el motivo.
+2. Si es válida, la **estrategia de su categoría** calcula el monto aprobado (RF2), y la solicitud se guarda como `PENDIENTE`.
+3. `PUT /api/solicitudes/{id}/estado` → el servicio guarda el nuevo estado y **después** notifica a todos los **observadores** (RF3). Cada uno decide si el cambio le interesa.
 
 ---
 
@@ -87,6 +132,12 @@ public SelectorCalculadora(List<CalculadoraReembolso> lista) {
 - Con un **`switch` manual**, cada categoría nueva obliga a editar el método selector y a volver a probarlo, y es fácil olvidar un `case` (el error aparecería en tiempo de ejecución).
 - **Costo aceptado:** el registro es implícito, porque no hay una lista visible de categorías en el código. Para compensarlo, `obtener()` falla con un mensaje claro (`Categoria no soportada: …`) si falta una estrategia, y `SelectorCalculadoraTest` cubre ese caso. Además, `Collectors.toMap` falla al iniciar la aplicación si dos calculadoras declaran la misma categoría, en vez de escoger una al azar.
 
+### Decisión 3 — Capas simples o Hexagonal (documentada en ADR-001)
+
+**Decisión:** la persistencia se mantiene en **capas simples**: `SolicitudReembolsoService` depende directamente de `RepositorioSolicitudesJpa`. En la notificación **no se introduce ningún cambio**, porque `ObservadorCambioEstado` ya es el seam para la integración de Contabilidad anunciada.
+
+**Justificación:** el criterio de la Guía (sección 6.2) para Hexagonal es durar 3 años o más **con cambios de infraestructura**. Ese criterio se aplicó por separado a cada dependencia externa, con los datos del proyecto, y da una respuesta distinta para cada una. El análisis completo, con las alternativas evaluadas y las consecuencias, está en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md), y su resumen en la sección siguiente.
+
 ### Decisión 4 — Qué partes de Spring se admiten en `procesamiento` (Regla 1 de ArchUnit)
 
 **Decisión:** la Regla 1 prohíbe que `procesamiento` dependa de `org.springframework.data`, `jakarta.persistence`, `org.springframework.web`, `org.springframework.http`, `..infraestructura..` y `..adaptadores..`. **No** prohíbe todo `org.springframework`, porque las 11 clases del paquete (3 calculadoras, el selector, 3 validadores, la cadena y 3 notificadores) usan `@Component`.
@@ -99,17 +150,38 @@ public SelectorCalculadora(List<CalculadoraReembolso> lista) {
 
 **Refinamiento propio:** la regla de la guía solo prohibía datos y persistencia. Como esta decisión argumenta que la capa web tampoco es aceptable, se agregaron `org.springframework.web..` y `org.springframework.http..` para que la regla haga cumplir lo que la decisión afirma.
 
-### Hallazgos sobre el código de referencia de la guía
+---
 
-Al implementar se encontraron siete inconsistencias en el código de ejemplo de la guía, y cada una se corrigió:
+## ADR-001 (resumen)
 
-1. **Tope de viaje contradictorio.** El `ValidadorMontoMaximo` de la guía usa un tope fijo de 150.000 para VIAJE, pero la calculadora reembolsa 150.000 **por día**. Un viaje de 3 días por 400.000 sería rechazado por la validación aunque el cálculo lo permite (tope real: 450.000). **Corrección:** cada estrategia expone `topeSolicitud(solicitud)` y el validador se lo pregunta a la estrategia de la categoría. Los topes quedan definidos en un solo lugar, y una categoría nueva no obliga a modificar el validador. Lo cubre el primer caso de `ValidadorMontoMaximoTest`.
-2. **Duplicados que ignoran el año.** El `ValidadorDuplicados` de la guía compara solo `getMonth()`, de modo que una solicitud pendiente de octubre de 2025 bloquearía una de octubre de 2026. **Corrección:** se compara el período completo con `YearMonth` (mes y año). Lo cubre `ValidadorDuplicadosTest.apruebaElMismoMesDeOtroAnio`.
-3. **Dominio «sin JPA» que JPA no puede persistir.** El checkpoint exige que el paquete `dominio` no importe nada de Spring ni de JPA, pero `RepositorioSolicitudesJpa extends JpaRepository<SolicitudReembolso, Long>` necesita que `SolicitudReembolso` sea una entidad. La guía no indica cómo conciliar ambas cosas. **Corrección:** el mapeo se declara en XML (`src/main/resources/META-INF/orm.xml`, con acceso por campos), que es parte del estándar JPA. La clase de dominio sigue siendo un objeto Java plano, y el detalle de persistencia (tabla, identificador autogenerado, enums guardados como texto) queda en la infraestructura.
-4. **Regla 3 de ArchUnit imposible de cumplir.** La regla de la guía exige que *todas* las clases no interfaz de `procesamiento.calculo` implementen `CalculadoraReembolso`, pero el propio código de la guía coloca `SelectorCalculadora` en ese paquete, y el selector no es una estrategia. **Corrección:** la regla se acota a las clases cuyo nombre empieza por `Calculadora` (`.and().haveSimpleNameStartingWith("Calculadora")`). Así se convierte en una convención verificable: toda clase `Calculadora*` del paquete debe ser una estrategia.
-5. **Las reglas también analizaban las pruebas.** Con `@AnalyzeClasses(packages = "com.empresa.reembolsos")`, ArchUnit importa también las clases de `src/test`, que viven en los mismos paquetes. `CalculadoraViajeTest` incumpliría la Regla 3, y `NotificadorEmpleadoTest` la Regla 4. **Corrección:** se usa `importOptions = ImportOption.DoNotIncludeTests.class`, de modo que las reglas evalúan solo el código de producción.
-6. **Regla 2 de ArchUnit que el propio controlador incumple.** La regla de la guía solo permite que `adaptadores.rest` acceda a `aplicacion`, `dominio`, `org.springframework.web`, `org.springframework.http` y `java`. Pero ArchUnit cuenta como acceso que el controlador lea **su propio campo** `servicio`, así que la regla falló 3 veces sin que hubiera ninguna violación real. **Corrección:** se agregó el propio paquete `..adaptadores.rest..` a los permitidos. La regla sigue prohibiendo lo que importa: que el controlador llegue a `procesamiento` o a `infraestructura` saltándose el servicio.
-7. **Las reglas no se ejecutaban en la suite completa.** Surefire solo ejecuta por defecto las clases cuyo nombre termina en `Test`, `Tests` o `TestCase`, o empieza por `Test`, y `ReglasArquitectura` no cumple ninguno de esos patrones. `mvn test -Dtest=ReglasArquitectura` sí las corría, pero `mvn test` y `mvn verify` las ignoraban en silencio: el paso «suite completa» del pipeline no las incluía. **Corrección:** se configuró `maven-surefire-plugin` en el `pom.xml` para incluir `**/ReglasArquitectura.java`, sin renombrar la clase que pide la guía.
+> Documento completo: [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md) · **Estado:** Aceptado · **Fecha:** 2026-10-31
+
+| | Persistencia (Spring Data JPA + H2) | Notificación a Contabilidad |
+|---|---|---|
+| **¿Cambio de infraestructura previsto?** | **No.** No hay plan de cambiar el motor de base de datos. | **Sí, con fecha:** integración por API externa el próximo trimestre. |
+| **Superficie de contacto hoy** | 1 clase (`SolicitudReembolsoService`) con 3 métodos (`findByEmpleadoIdAndEstado`, `findById`, `save`) | El servicio solo conoce `List<ObservadorCambioEstado>` |
+| **Decisión** | **Capas simples.** Un puerto hoy sería YAGNI: una abstracción con una única implementación posible. | **Ningún cambio.** La API se implementará como un nuevo observador en `infraestructura` (`NotificadorContabilidadApi`), que reemplazará a `NotificadorContabilidad`. |
+
+**Alternativas evaluadas:**
+1. Hexagonal completa.
+2. Hexagonal solo para la persistencia.
+3. Capas simples (**elegida**).
+
+**Consecuencias positivas:**
+- No hay interfaces ni adaptadores sin un caso de uso que los justifique.
+- El único cambio con fecha ya tiene su punto de extensión.
+- La deuda es pequeña y acotada: gracias a `orm.xml` no harían falta mappers, y la Regla 1 impide que JPA se filtre a `procesamiento`. Introducir el puerto costaría una interfaz de 3 métodos y un cambio de tipo en un constructor.
+
+**Consecuencias negativas:**
+- Si se cambia de motor de base de datos, el puerto deberá introducirse retroactivamente.
+- El servicio sigue acoplado a Spring Data, por eso se cubre con la prueba de integración.
+- La asimetría entre persistencia y notificación puede parecer inconsistente sin leer el ADR.
+- **Riesgo identificado:** los observadores se ejecutan en secuencia. Una falla de la futura API externa impediría notificar a los siguientes, así que deberá aislarse dentro del nuevo observador.
+
+**Señales para revisar la decisión:**
+- Un plan concreto de cambio de motor de base de datos o de un segundo almacenamiento.
+- Una segunda aplicación que reutilice el servicio sin JPA.
+- Que la integración de Contabilidad exija más que un observador nuevo.
 
 ---
 
@@ -157,11 +229,91 @@ Durante el diseño y la implementación se consideraron alternativas más sofist
 
 ---
 
+## Validación arquitectónica en GitHub Actions
+
+El workflow [`.github/workflows/arquitectura.yml`](.github/workflows/arquitectura.yml) se ejecuta en cada push y pull request a `main`:
+1. Primero corre `./mvnw test -Dtest=ReglasArquitectura`.
+2. Después corre la suite completa con `./mvnw verify`.
+
+Usa `actions/checkout@v5` y `actions/setup-java@v5` con caché de Maven integrada, en lugar de las `@v4` y de `actions/cache@v3` de la guía, que ya están obsoletas.
+
+### Reglas de arquitectura (`ReglasArquitectura.java`)
+
+| # | Regla | Qué protege |
+|---|-------|-------------|
+| 1 | `procesamientoSinPersistenciaNiWeb` | Los tres patrones no dependen de `infraestructura`, `adaptadores`, Spring Data, JPA ni la capa web (Decisión 4) |
+| 2 | `controladorSoloUsaServicioYDominio` | El adaptador REST no se salta el servicio de aplicación |
+| 3 | `calculadorasImplementanCalculadoraReembolso` | Toda clase `Calculadora*` es una estrategia de RF2 |
+| 4 | `notificadoresImplementanObservadorCambioEstado` | Todo lo que vive en `notificacion` es un observador de RF3 |
+
+### Prueba de una violación intencional
+
+Para comprobar que el pipeline de verdad protege los límites, se introdujo a propósito un «atajo»: el validador de duplicados consulta la base de datos directamente, en vez de recibir la lista de pendientes desde el servicio.
+
+```java
+// ValidadorDuplicados.java — commit 77b7af1 (revertido en c7947ee)
+@Autowired
+private RepositorioSolicitudesJpa repositorio;   // procesamiento → infraestructura
+```
+
+La violación **compila y no rompe ninguna prueba funcional**: el campo no cambia el comportamiento. Solo ArchUnit la detecta. Se declaró un campo y no solo un `import`, porque un import sin usar desaparece al compilar y ArchUnit analiza el código compilado.
+
+**Historial de builds:**
+- ✅ #1 y #2: estado inicial.
+- ❌ #3 (`77b7af1`): la violación intencional.
+- ✅ #4 (`c7947ee`): se corrigió con `git revert`, que conserva en el historial tanto el error como su corrección.
+
+![Historial de GitHub Actions: build fallido por la violación y build en verde tras el revert](docs/pipeline-historial.png)
+
+**Detalle del build fallido:** el job se detiene en el paso «Ejecutar reglas de arquitectura», y ArchUnit identifica la regla, el motivo (`because ...`) y la línea exacta de la violación: `Field <...ValidadorDuplicados.repositorio> has type <...infraestructura.RepositorioSolicitudesJpa>`.
+
+![Build fallido: ArchUnit detecta que ValidadorDuplicados depende de RepositorioSolicitudesJpa](docs/pipeline-fallido.png)
+
+---
+
+## Hallazgos sobre el código de referencia de la guía
+
+Al implementar se encontraron siete inconsistencias en el código de ejemplo de la guía, y cada una se corrigió:
+
+1. **Tope de viaje contradictorio.** El `ValidadorMontoMaximo` de la guía usa un tope fijo de 150.000 para VIAJE, pero la calculadora reembolsa 150.000 **por día**. Un viaje de 3 días por 400.000 sería rechazado por la validación aunque el cálculo lo permite (tope real: 450.000). **Corrección:** cada estrategia expone `topeSolicitud(solicitud)` y el validador se lo pregunta a la estrategia de la categoría. Los topes quedan definidos en un solo lugar, y una categoría nueva no obliga a modificar el validador. Lo cubre el primer caso de `ValidadorMontoMaximoTest`.
+2. **Duplicados que ignoran el año.** El `ValidadorDuplicados` de la guía compara solo `getMonth()`, de modo que una solicitud pendiente de octubre de 2025 bloquearía una de octubre de 2026. **Corrección:** se compara el período completo con `YearMonth` (mes y año). Lo cubre `ValidadorDuplicadosTest.apruebaElMismoMesDeOtroAnio`.
+3. **Dominio «sin JPA» que JPA no puede persistir.** El checkpoint exige que el paquete `dominio` no importe nada de Spring ni de JPA, pero `RepositorioSolicitudesJpa extends JpaRepository<SolicitudReembolso, Long>` necesita que `SolicitudReembolso` sea una entidad. La guía no indica cómo conciliar ambas cosas. **Corrección:** el mapeo se declara en XML (`src/main/resources/META-INF/orm.xml`, con acceso por campos), que es parte del estándar JPA. La clase de dominio sigue siendo un objeto Java plano, y el detalle de persistencia (tabla, identificador autogenerado, enums guardados como texto) queda en la infraestructura.
+4. **Regla 3 de ArchUnit imposible de cumplir.** La regla de la guía exige que *todas* las clases no interfaz de `procesamiento.calculo` implementen `CalculadoraReembolso`, pero el propio código de la guía coloca `SelectorCalculadora` en ese paquete, y el selector no es una estrategia. **Corrección:** la regla se acota a las clases cuyo nombre empieza por `Calculadora` (`.and().haveSimpleNameStartingWith("Calculadora")`). Así se convierte en una convención verificable: toda clase `Calculadora*` del paquete debe ser una estrategia.
+5. **Las reglas también analizaban las pruebas.** Con `@AnalyzeClasses(packages = "com.empresa.reembolsos")`, ArchUnit importa también las clases de `src/test`, que viven en los mismos paquetes. `CalculadoraViajeTest` incumpliría la Regla 3, y `NotificadorEmpleadoTest` la Regla 4. **Corrección:** se usa `importOptions = ImportOption.DoNotIncludeTests.class`, de modo que las reglas evalúan solo el código de producción.
+6. **Regla 2 de ArchUnit que el propio controlador incumple.** La regla de la guía solo permite que `adaptadores.rest` acceda a `aplicacion`, `dominio`, `org.springframework.web`, `org.springframework.http` y `java`. Pero ArchUnit cuenta como acceso que el controlador lea **su propio campo** `servicio`, así que la regla falló 3 veces sin que hubiera ninguna violación real. **Corrección:** se agregó el propio paquete `..adaptadores.rest..` a los permitidos. La regla sigue prohibiendo lo que importa: que el controlador llegue a `procesamiento` o a `infraestructura` saltándose el servicio.
+7. **Las reglas no se ejecutaban en la suite completa.** Surefire solo ejecuta por defecto las clases cuyo nombre termina en `Test`, `Tests` o `TestCase`, o empieza por `Test`, y `ReglasArquitectura` no cumple ninguno de esos patrones. `mvn test -Dtest=ReglasArquitectura` sí las corría, pero `mvn test` y `mvn verify` las ignoraban en silencio: el paso «suite completa» del pipeline no las incluía. **Corrección:** se configuró `maven-surefire-plugin` en el `pom.xml` para incluir `**/ReglasArquitectura.java`, sin renombrar la clase que pide la guía.
+
+---
+
+## Pruebas
+
+**52 pruebas en total.** Todas se ejecutan con `./mvnw test`, y también en el pipeline.
+
+| Tipo | Clase | Pruebas | Qué verifica |
+|------|-------|:-------:|--------------|
+| Unitaria (RF2) | `CalculadoraViajeTest` | 3 | Tope diario × días: bajo el tope, en el tope y sobre el tope |
+| Unitaria (RF2) | `CalculadoraRepresentacionTest` | 3 | Monto completo hasta el tope mensual |
+| Unitaria (RF2) | `CalculadoraCapacitacionTest` | 3 | 80 % hasta el tope anual |
+| Unitaria (RF2) | `SelectorCalculadoraTest` | 2 | Entrega la estrategia de cada categoría y rechaza una no registrada |
+| Unitaria (RF1) | `ValidadorDocumentosSoporteTest` | 2 | Con y sin documentos |
+| Unitaria (RF1) | `ValidadorMontoMaximoTest` | 8 | Topes de las 3 categorías tomados de la estrategia (incluido el viaje de 3 días por 400.000) |
+| Unitaria (RF1) | `ValidadorDuplicadosTest` | 4 | Mismo mes, mismo mes de otro año, otra categoría y sin pendientes |
+| Unitaria (RF1) | `CadenaValidadoresTest` | 3 | Orden de la cadena y corte en el primer rechazo, sin ejecutar el eslabón costoso |
+| Unitaria (RF3) | `NotificadorEmpleadoTest` | 3 | Avisa al empleado de todo resultado |
+| Unitaria (RF3) | `NotificadorContabilidadTest` | 4 | Solo actúa con `APROBADA` |
+| Unitaria (RF3) | `NotificadorAuditoriaTest` | 4 | Registra los 4 estados, sin excepción |
+| Integración | `FlujoSolicitudReembolsoIntegracionTest` | 8 | `@SpringBootTest` + MockMvc: las 3 categorías, el rechazo sin documentos, el duplicado, los 3 observadores al aprobar, Contabilidad callada al rechazar, y 404 |
+| Integración | `ReembolsosApplicationTests` | 1 | El contexto de Spring arranca |
+| Arquitectura | `ReglasArquitectura` | 4 | Las 4 reglas de ArchUnit |
+
+---
+
 ## Ejecución
 
 ```bash
-./mvnw test             # pruebas unitarias y de integración
-./mvnw spring-boot:run  # API en http://localhost:8080
+./mvnw test                            # las 52 pruebas
+./mvnw test -Dtest=ReglasArquitectura  # solo las 4 reglas de arquitectura
+./mvnw spring-boot:run                 # API en http://localhost:8080
 ```
 
 Crear una solicitud (RF1 valida y RF2 calcula el monto aprobado):
