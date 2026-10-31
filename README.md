@@ -89,7 +89,38 @@ public SelectorCalculadora(List<CalculadoraReembolso> lista) {
 
 ### Hallazgos sobre el código de referencia de la guía
 
-Al implementar se encontraron dos inconsistencias en el código de ejemplo, que se corrigieron con su prueba correspondiente:
+Al implementar se encontraron tres inconsistencias en el código de ejemplo de la guía, y cada una se corrigió:
 
 1. **Tope de viaje contradictorio.** El `ValidadorMontoMaximo` de la guía usa un tope fijo de 150.000 para VIAJE, pero la calculadora reembolsa 150.000 **por día**. Un viaje de 3 días por 400.000 sería rechazado por la validación aunque el cálculo lo permite (tope real: 450.000). **Corrección:** cada estrategia expone `topeSolicitud(solicitud)` y el validador se lo pregunta a la estrategia de la categoría. Los topes quedan definidos en un solo lugar, y una categoría nueva no obliga a modificar el validador. Lo cubre el primer caso de `ValidadorMontoMaximoTest`.
 2. **Duplicados que ignoran el año.** El `ValidadorDuplicados` de la guía compara solo `getMonth()`, de modo que una solicitud pendiente de octubre de 2025 bloquearía una de octubre de 2026. **Corrección:** se compara el período completo con `YearMonth` (mes y año). Lo cubre `ValidadorDuplicadosTest.apruebaElMismoMesDeOtroAnio`.
+3. **Dominio «sin JPA» que JPA no puede persistir.** El checkpoint exige que el paquete `dominio` no importe nada de Spring ni de JPA, pero `RepositorioSolicitudesJpa extends JpaRepository<SolicitudReembolso, Long>` necesita que `SolicitudReembolso` sea una entidad. La guía no indica cómo conciliar ambas cosas. **Corrección:** el mapeo se declara en XML (`src/main/resources/META-INF/orm.xml`, con acceso por campos), que es parte del estándar JPA. La clase de dominio sigue siendo un objeto Java plano, y el detalle de persistencia (tabla, identificador autogenerado, enums guardados como texto) queda en la infraestructura.
+
+---
+
+## Ejecución
+
+```bash
+./mvnw test             # pruebas unitarias y de integración
+./mvnw spring-boot:run  # API en http://localhost:8080
+```
+
+Crear una solicitud (RF1 valida y RF2 calcula el monto aprobado):
+
+```bash
+curl -X POST http://localhost:8080/api/solicitudes -H "Content-Type: application/json" \
+  -d '{"empleadoId":"E-001","categoria":"VIAJE","montoSolicitado":400000,"fechaGasto":"2026-10-15","diasViaje":3,"documentosSoporte":true}'
+# -> 200, "estado":"PENDIENTE", "montoAprobado":400000  (tope: 3 días x 150.000 = 450.000)
+# Con 500000 respondería 400: "Monto excede el tope de la categoria VIAJE (450000)"
+```
+
+Cambiar su estado (RF3 notifica a los tres observadores):
+
+```bash
+curl -X PUT http://localhost:8080/api/solicitudes/1/estado -H "Content-Type: application/json" -d '"APROBADA"'
+```
+
+Una solicitud rechazada por la cadena de validación responde **400** con el motivo, en formato Problem Details:
+
+```json
+{ "status": 400, "title": "Solicitud de reembolso rechazada", "detail": "Faltan documentos soporte" }
+```

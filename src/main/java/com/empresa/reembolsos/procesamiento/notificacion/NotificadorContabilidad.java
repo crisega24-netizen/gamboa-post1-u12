@@ -18,6 +18,6 @@ public class NotificadorContabilidad implements ObservadorCambioEstado {
             return;
         }
         log.info("Contabilidad: programar pago de {} para {} (solicitud {})",
-                solicitud.getMontoAprobado().toPlainString(), solicitud.getEmpleadoId(), solicitud.getId());
+                solicitud.getMontoAprobado().stripTrailingZeros().toPlainString(), solicitud.getEmpleadoId(), solicitud.getId());
     }
 }
